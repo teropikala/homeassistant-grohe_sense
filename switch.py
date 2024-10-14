@@ -51,8 +51,10 @@ class GroheSenseGuardValve(SwitchEntity):
     @Throttle(VALVE_UPDATE_DELAY)
     async def async_update(self):
         command_response = await self._auth_session.get(BASE_URL + f'locations/{self._locationId}/rooms/{self._roomId}/appliances/{self._applianceId}/command')
+        _LOGGER.debug('Got command response: %s', command_response)
         if 'command' in command_response and 'valve_open' in command_response['command']:
             self._is_on = command_response['command']['valve_open']
+            _LOGGER.debug('Updated valve state to %s', self._is_on)
         else:
             _LOGGER.error('Failed to parse out valve_open from commands response: %s', command_response)
 
