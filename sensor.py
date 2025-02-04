@@ -5,7 +5,7 @@ from datetime import (datetime, timezone, timedelta)
 
 from homeassistant.helpers.entity import Entity
 from homeassistant.util import Throttle
-from homeassistant.const import (STATE_UNAVAILABLE, STATE_UNKNOWN, TEMP_CELSIUS, DEVICE_CLASS_TEMPERATURE, PERCENTAGE, DEVICE_CLASS_HUMIDITY, VOLUME_FLOW_RATE_CUBIC_METERS_PER_HOUR, PRESSURE_MBAR, DEVICE_CLASS_PRESSURE, TEMP_CELSIUS, DEVICE_CLASS_TEMPERATURE, VOLUME_LITERS)
+from homeassistant.const import (VOLUME_LITERS, STATE_UNAVAILABLE, STATE_UNKNOWN, TEMP_CELSIUS, DEVICE_CLASS_TEMPERATURE, PERCENTAGE, DEVICE_CLASS_HUMIDITY, VOLUME_FLOW_RATE_CUBIC_METERS_PER_HOUR, PRESSURE_BAR, DEVICE_CLASS_PRESSURE, TEMP_CELSIUS, DEVICE_CLASS_TEMPERATURE, VOLUME_LITERS)
 
 from homeassistant.helpers import aiohttp_client
 
@@ -21,8 +21,9 @@ SENSOR_TYPES = {
         'temperature': SensorType(TEMP_CELSIUS, DEVICE_CLASS_TEMPERATURE, lambda x : x),
         'humidity': SensorType(PERCENTAGE, DEVICE_CLASS_HUMIDITY, lambda x : x),
         'flowrate': SensorType(VOLUME_FLOW_RATE_CUBIC_METERS_PER_HOUR, None, lambda x : x * 3.6),
-        'pressure': SensorType(PRESSURE_MBAR, DEVICE_CLASS_PRESSURE, lambda x : x * 1000),
+        'pressure': SensorType(PRESSURE_BAR, DEVICE_CLASS_PRESSURE, lambda x : x * 1000),
         'temperature_guard': SensorType(TEMP_CELSIUS, DEVICE_CLASS_TEMPERATURE, lambda x : x),
+        #'waterconsumption': SensorType(VOLUME_LITERS, None, lambda x : x)
         }
 
 SENSOR_TYPES_PER_UNIT = {
@@ -96,15 +97,16 @@ class GroheSenseGuardReader:
     def applianceId(self):
         """ returns the appliance Identifier, looks like a UUID, so hopefully unique """
         return self._applianceId
+    
+    
 
     async def async_update(self):
+        _LOGGER.debug('Updating appliance %s', self._applianceId)
         if self._fetching_data != None:
             await self._fetching_data.wait()
             return
 
-        # XXX: Hardcoded 15 minute interval for now. Would be prettier to set this a bit more dynamically
-        # based on the json response for the sense guard, and probably hardcode something longer for the sense.
-        if datetime.now() - self._data_fetch_completed < timedelta(minutes=15):
+        if datetime.now() - self._data_fetch_completed < timedelta(minutes=10):
             _LOGGER.debug('Skipping fetching new data, time since last fetch was only %s', datetime.now() - self._data_fetch_completed)
             return
 
@@ -112,56 +114,55 @@ class GroheSenseGuardReader:
         self._fetching_data = asyncio.Event()
 
         def parse_time(s):
-            # XXX: Fix for python 3.6 - Grohe emits time zone as "+HH:MM", python 3.6's %z only accepts the format +HHMM
-            # So, some ugly code to remove the colon for now...
             if s.rfind(':') > s.find('+'):
                 s = s[:s.rfind(':')] + s[s.rfind(':')+1:]
             return datetime.strptime(s, '%Y-%m-%dT%H:%M:%S.%f%z')
 
-        poll_from=self._poll_from.strftime('%Y-%m-%d')
-        measurements_response = await self._auth_session.get(BASE_URL + f'locations/{self._locationId}/rooms/{self._roomId}/appliances/{self._applianceId}/data?from={poll_from}')
+        poll_from = self._poll_from.strftime('%Y-%m-%d')
+        measurements_response = await self._auth_session.get(BASE_URL + f'locations/{self._locationId}/rooms/{self._roomId}/appliances/{self._applianceId}/data/aggregated?from={poll_from}')
+        _LOGGER.debug('Data read: %s', measurements_response['data'])
+
         if 'withdrawals' in measurements_response['data']:
             withdrawals = measurements_response['data']['withdrawals']
             _LOGGER.debug('Received %d withdrawals in response', len(withdrawals))
             for w in withdrawals:
-                w['starttime'] = parse_time(w['starttime'])
-            withdrawals = [ w for w in withdrawals if w['starttime'] > self._poll_from]
-            withdrawals.sort(key = lambda x: x['starttime'])
-
-            _LOGGER.debug('Got %d new withdrawals totaling %f volume', len(withdrawals), sum((w['waterconsumption'] for w in withdrawals)))
+                _LOGGER.debug("Raw starttime:", repr(w))
+                date_str = w['date']
+                if len(date_str) == 10:  # Check if the date string is in 'YYYY-MM-DD' format
+                    date_str += 'T00:00:00.000000+0000'  # Add default time and timezone
+                w['starttime'] = parse_time(date_str)
+            withdrawals = [w for w in withdrawals if w['starttime'] > self._poll_from]
+            withdrawals.sort(key=lambda x: x['starttime'])
+            _LOGGER.debug('Gots %d new withdrawals totaling %f volume', len(withdrawals), sum((w['waterconsumption'] for w in withdrawals)))
             self._withdrawals += withdrawals
             if len(self._withdrawals) > 0:
                 self._poll_from = max(self._poll_from, self._withdrawals[-1]['starttime'])
         elif self._type != GROHE_SENSE_TYPE:
-            _LOGGER.info('Data response for appliance %s did not contain any withdrawals data', self._applianceId)
+            _LOGGER.debug('Data response for appliance %s did not contain any withdrawals data', self._applianceId)
 
         if 'measurement' in measurements_response['data']:
+            _LOGGER.debug('Received %d measurements in response - RIEKANDEBUG', len(measurements_response['data']['measurement']))
             measurements = measurements_response['data']['measurement']
-            measurements.sort(key = lambda x: x['timestamp'])
+            measurements.sort(key=lambda x: x['date'])
             if len(measurements):
                 for key in SENSOR_TYPES_PER_UNIT[self._type]:
+                    _LOGGER.debug('key: %s', key)
                     if key in measurements[-1]:
                         self._measurements[key] = measurements[-1][key]
-                self._poll_from = max(self._poll_from, parse_time(measurements[-1]['timestamp']))
+                self._poll_from = datetime.strptime(measurements[-1]['date'], '%Y-%m-%d')
         else:
             _LOGGER.info('Data response for appliance %s did not contain any measurements data', self._applianceId)
-
 
         self._data_fetch_completed = datetime.now()
 
         self._fetching_data.set()
         self._fetching_data = None
-
     def consumption(self, since):
-        # XXX: As self._withdrawals is sorted, we could speed this up by a binary search,
-        #      but most likely data sets are small enough that a linear scan is fine.
-        return sum((w['waterconsumption'] for w in self._withdrawals if w['starttime'] >= since))
-
-    def measurement(self, key):
-        if key in self._measurements:
-            return self._measurements[key]
-        return STATE_UNKNOWN
-
+        # Filtere die Wasserentnahmen ab dem Zeitpunkt 'since'
+        withdrawals_since = [w for w in self._withdrawals if w['starttime'] > since]
+        # Summiere den Wasserverbrauch
+        total_consumption = sum(w['waterconsumption'] for w in withdrawals_since)
+        return total_consumption if withdrawals_since else 0
 
 class GroheSenseNotificationEntity(Entity):
     def __init__(self, auth_session, locationId, roomId, applianceId, name):
@@ -194,7 +195,7 @@ class GroheSenseGuardWithdrawalsEntity(Entity):
         self._reader = reader
         self._name = name
         self._days = days
-
+        _LOGGER.info('reader: %s', repr(reader)) 
     #@property
     #def unique_id(self):
     #    return '{}-{}'.format(self._reader.applianceId, self._days)
@@ -213,7 +214,8 @@ class GroheSenseGuardWithdrawalsEntity(Entity):
             since = datetime.now().astimezone().replace(hour=0,minute=0,second=0,microsecond=0)
         else: # otherwise, it's a rolling X day average
             since = datetime.now(tz=timezone.utc) - timedelta(self._days)
-        return self._reader.consumption(since)
+        consumption_value = self._reader.consumption(since)
+        return consumption_value if consumption_value is not None else 0
 
     async def async_update(self):
         await self._reader.async_update()
@@ -238,7 +240,7 @@ class GroheSenseSensorEntity(Entity):
 
     @property
     def state(self):
-        raw_state = self._reader.measurement(self._key)
+        raw_state = self._reader._measurements.get(self._key, STATE_UNKNOWN)
         if raw_state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
             return raw_state
         else:
